@@ -319,10 +319,33 @@ test('a release moves the v0 tag that copies call, and only in the template', as
   const text = await workflow('release.yml');
   assert.match(text, /^# whatiiif: template only\./);
   assert.match(text, /if: github\.event\.repository\.is_template/);
-  assert.match(text, /git tag -f "\$major"/);
   // A pre-release is for trying out: copies keep running the last full release.
   assert.match(text, /if: github\.event\.repository\.is_template && !github\.event\.release\.prerelease/);
-  assert.match(text, /::error title=\$major still points at the previous release::.*move it by hand/, 'a tag left behind says how to move it');
+  assert.match(text, /::error title=v0 still points at the previous release::.*move it by hand/, 'a tag left behind says how to move it');
+});
+
+test('every release moves v0, 1.0.0 and later too: copies call the steps at v0, and cannot be made to call another tag', async () => {
+  // The step's script, run as the workflow runs it, in a clone of a repository whose releases are tagged.
+  const text = await workflow('release.yml');
+  const [, block] = text.match(/\n {8}run: \|\n((?: {10}.*\n)+)/);
+  const script = block.replace(/^ {10}/gm, '');
+  const origin = await tempDir('origin');
+  await git(origin, ['init', '-q', '--bare']);
+  const here = await tempDir('here');
+  await git(here, ['init', '-q']);
+  await writeFile(join(here, 'a'), '0.4.0');
+  await commit(here, '0.4.0');
+  await git(here, ['tag', 'v0.4.0']);
+  await git(here, ['tag', 'v0']);
+  await writeFile(join(here, 'a'), '1.0.0');
+  await commit(here, '1.0.0');
+  await git(here, ['tag', 'v1.0.0']);
+  await git(here, ['remote', 'add', 'origin', origin]);
+  await git(here, ['push', '-q', 'origin', 'HEAD:main', '--tags']);
+  const moved = await run('bash', ['-c', script], { cwd: here, env: { TAG: 'v1.0.0' } });
+  assert.equal(moved.code, 0, moved.stderr);
+  const tagged = async (tag) => (await git(origin, ['rev-parse', `${tag}^{commit}`])).stdout.trim();
+  assert.equal(await tagged('v0'), await tagged('v1.0.0'));
 });
 
 test('packages are kept up to date in the template only, and checked before they are offered', async () => {
@@ -337,6 +360,68 @@ test('packages are kept up to date in the template only, and checked before they
   await assert.rejects(read(join(template, '.github/dependabot.yml')));
 });
 
+test("once both demos are up, the README's screenshots of them are remade on a Mac and committed if they changed", async () => {
+  const text = await workflow('live.yml');
+  const job = text.slice(text.indexOf('\n  screenshots:'));
+  assert.match(job, /needs: demo/);
+  assert.match(job, /runs-on: macos-/);
+  assert.match(job, /node engine\/test\/support\/readme-screenshots\.js/);
+  assert.match(job, /contents: write/);
+  assert.match(job, /git push -q origin HEAD:main/);
+});
+
+/**
+ * A demo made from the template, as a bare repository holding only its picture, and a `gh` that answers for its
+ * Deploy run: watching it is cut off by the network the first time, while the run goes on; watched again, it
+ * ends in `conclusion`.
+ */
+async function demoToDeploy(conclusion) {
+  const demo = await tempDir('demo');
+  await git(demo, ['init', '-q', '--bare']);
+  const seed = await tempDir('seed');
+  await git(seed, ['init', '-q']);
+  await mkdir(join(seed, 'content'));
+  await writeFile(join(seed, 'content/picture.png'), 'a picture');
+  await commit(seed, 'The demo');
+  await git(seed, ['push', '-q', demo, 'HEAD']);
+  const bin = await tempDir('bin');
+  const log = join(bin, 'calls');
+  await writeFile(
+    join(bin, 'gh'),
+    `#!/bin/bash
+echo "$*" >> "${log}"
+case "$1 $2" in
+  "run list") echo 42 ;;
+  "run watch") if [ ! -e "${log}.cut" ]; then touch "${log}.cut"; echo 'read: connection reset by peer' >&2; exit 1; fi; touch "${log}.ended" ;;
+  "run view") if [ -e "${log}.ended" ]; then echo ${conclusion}; else echo; fi ;;
+  *) echo "unexpected gh call: $*" >&2; exit 1 ;;
+esac
+`,
+  );
+  await chmod(join(bin, 'gh'), 0o755);
+  const cwd = await templateCopy();
+  const result = await run('bash', ['engine/test/live/deploy-demo.sh', 'someone/demo'], { cwd, env: { PATH: `${bin}:${process.env.PATH}`, DEMO_GIT_URL: demo } });
+  return { ...result, calls: await read(log) };
+}
+
+test("a demo's Deploy is judged by how its run ended, not by a watch of it that the network cut off", async () => {
+  const deployed = await demoToDeploy('success');
+  assert.equal(deployed.code, 0, deployed.stderr);
+  assert.equal(deployed.stdout.trim().split('\n').at(-1), 'https://someone.github.io/demo/');
+  assert.match(deployed.calls, /run watch 42[^\n]*\n(?:.*\n)*run watch 42/, 'watched again once cut off');
+
+  const failed = await demoToDeploy('failure');
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /someone\/demo's Deploy ended in failure: https:\/\/github\.com\/someone\/demo\/actions\/runs\/42/);
+});
+
+test('the trials in new repositories made from the template are run by hand, not by Live, which would need a token that may make and delete repositories', async () => {
+  const text = await workflow('live.yml');
+  assert.doesNotMatch(text, /\n  trial:|npm run test:live\n|LIVE_TRIAL_TOKEN/);
+  assert.match(text, /run by hand, with `npm run test:live`/);
+  assert.match(await read(join(template, 'DEVELOPING.md')), /Run them before every\s+release/);
+});
+
 test('after each change, the Live workflow publishes the template to both demos, the plain one and the one with notes', async () => {
   const text = await workflow('live.yml');
   assert.match(text, /^# whatiiif: template only\./);
@@ -345,6 +430,9 @@ test('after each change, the Live workflow publishes the template to both demos,
   }
   assert.match(text, /vars\[matrix\.demo\.repository\]/);
   assert.match(text, /secrets\[matrix\.demo\.key\]/);
+  // Kept in step after every release and every day too, not only after a change.
+  assert.match(text, /\n {2}release:\n {4}types: \[published\]/);
+  assert.match(text, /\n {2}schedule:\n {4}- cron: /);
   // The demos run publish.yml at the commit tried, so a change to it alone is tried on them too.
   assert.match(text, /paths: \[[^\]]*'\.github\/workflows\/publish\.yml'/);
 });

@@ -42,8 +42,8 @@ export const git = (cwd, args, { lfs = false } = {}) =>
   exec('git', [...AS_ME, ...(lfs ? [] : NO_LFS), ...args], { cwd, env: { ...process.env, GIT_LFS_SKIP_SMUDGE: '1' }, maxBuffer: 64 * 1024 * 1024 });
 
 /**
- * Points a copy's workflows, which call the template's steps at the v0 tag (the last release), at commit `sha`
- * instead, so a trial runs the steps being tried. GitHub must have that commit.
+ * Points a copy's workflows, which call the template's steps at the tag of its major version (v1 for 1.x, the last
+ * release), at commit `sha` instead, so a trial runs the steps being tried. GitHub must have that commit.
  */
 async function callStepsAt(work, sha, upstream) {
   if ((await run('gh', ['api', `repos/${upstream}/commits/${sha}`, '--silent'])).code !== 0) {
@@ -52,14 +52,15 @@ async function callStepsAt(work, sha, upstream) {
   const dir = join(work, '.github/workflows');
   for (const file of await readdir(dir)) {
     const text = await readFile(join(dir, file), 'utf8');
-    await writeFile(join(dir, file), text.replace(/(uses: \S+\/\.github\/workflows\/[^@\s]+)@v0$/gm, `$1@${sha}`));
+    await writeFile(join(dir, file), text.replace(/(uses: \S+\/\.github\/workflows\/[^@\s]+)@v\d+$/gm, `$1@${sha}`));
   }
 }
 
 /**
  * A new public repository made with "Use this template", cloned, with the template's files (everything but
  * content/) replaced by those at `ref` here: HEAD to try this commit, or a release tag to start from that release.
- * Its workflows call the template's steps at `ref` too.
+ * A site made at a release is that release exactly, its workflows calling the steps at the tag they name, as a real
+ * site's do; one trying this commit calls this commit's steps, the only way to try them before they are released.
  */
 export async function trialRepository(ref = 'HEAD') {
   const owner = await gh('api', 'user', '--jq', '.login');
@@ -77,7 +78,7 @@ export async function trialRepository(ref = 'HEAD') {
   const entries = top.split('\n').filter((entry) => entry && entry !== 'content');
   await exec('bash', ['-c', 'git archive "$1" -- "${@:2}" | tar -x -C "$0"', work, ref, ...entries], { cwd: template });
   const { stdout: sha } = await exec('git', ['rev-parse', `${ref}^{commit}`], { cwd: template });
-  await callStepsAt(work, sha.trim(), upstream);
+  if (ref === 'HEAD') await callStepsAt(work, sha.trim(), upstream);
   await git(work, ['add', '-A']);
   if ((await run('git', ['diff', '--cached', '--quiet'], { cwd: work })).code !== 0) {
     await git(work, ['commit', '-q', '-m', `The template at ${ref}`]);
